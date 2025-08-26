@@ -1,6 +1,6 @@
 {
   "name": "vite-plugin-node-worker",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Vite plugin for Node.js worker threads. Supports DEV and BUILD modes.",
   "main": "index.js",
   "type": "module",
@@ -22,12 +22,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/aheissenberger/vite-node-worker-dev.git"
+    "url": "https://github.com/aheissenberger/vite-plugin-node-worker.git"
   },
   "bugs": {
-    "url": "https://github.com/aheissenberger/vite-node-worker-dev/issues"
+    "url": "https://github.com/aheissenberger/vite-plugin-node-worker/issues"
   },
-  "homepage": "https://github.com/aheissenberger/vite-node-worker-dev#readme",
+  "homepage": "https://github.com/aheissenberger/vite-plugin-node-worker#readme",
   "files": [
     "index.js",
     "vite-plugin-node-worker.d.ts"
