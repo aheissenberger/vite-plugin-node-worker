@@ -4,7 +4,7 @@ import path from "node:path";
 import { pathToFileURL, URL, URLSearchParams } from "node:url";
 
 import MagicString from "magic-string";
-import { transformWithEsbuild } from "vite";
+import { transformWithEsbuild, normalizePath } from "vite";
 
 const DEBUG = process.env.VNW_DEBUG === "1";
 
@@ -36,8 +36,10 @@ function sha1(s) {
 }
 
 function toRelativePath(filename, importer) {
-  const relPath = path.posix.relative(path.dirname(importer), filename);
-  return relPath.startsWith(".") ? relPath : `./${relPath}`;
+  const from = path.posix.dirname(importer);
+  const relPath = path.posix.relative(from, filename);
+  const norm = normalizePath(relPath);
+  return norm.startsWith(".") ? norm : `./${norm}`;
 }
 
 const queryRE = /\?.*$/s;
@@ -116,6 +118,7 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
 
   // Cache transpiled outputs by (fsPath, mtime) to avoid re-transpiling unchanged files
   const esbuildCache = new Map(); // key: fsPath, value: { mtimeMs: number, code: string }
+  const resolveCache = new Map(); // key: `${fromFile}::${spec}` -> string | null
 
   function getMtimeMsSafe(p) {
     try {
@@ -132,14 +135,16 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
 
   async function resolveToFs(spec, fromFile) {
     if (!spec || typeof spec !== "string") return null;
+    const cacheKey = `${fromFile || ''}::${spec}`;
+    if (resolveCache.has(cacheKey)) return resolveCache.get(cacheKey);
 
     // Treat external URL-like imports as non-rewritable
-    if (/^(?:https?:|data:|deno:)/.test(spec)) return null;
+    if (/^(?:https?:|data:|deno:)/.test(spec)) { resolveCache.set(cacheKey, null); return null; }
 
     // Normalize node: scheme and skip node built-ins entirely
     const noNodePrefix = spec.replace(/^node:/, "");
     const isBare = !spec.startsWith(".") && !spec.startsWith("/") && !spec.startsWith("file:") && !/^[A-Za-z]:\\/.test(spec);
-    if (isBare && NODE_BUILTINS.has(noNodePrefix)) return null;
+    if (isBare && NODE_BUILTINS.has(noNodePrefix)) { resolveCache.set(cacheKey, null); return null; }
 
     // Apply project aliases for non-relative, non-absolute specs first
     if (isBare) {
@@ -149,32 +154,28 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
         const r = await env.pluginContainer.resolveId(spec, fromFile);
         if (r && r.id) {
           // Explicit externals or node: builtins – do not rewrite
-          if (r.external) return null;
-          if (r.id.startsWith("node:")) return null;
+          if (r.external) { resolveCache.set(cacheKey, null); return null; }
+          if (r.id.startsWith("node:")) { resolveCache.set(cacheKey, null); return null; }
 
           // /@fs/ -> absolute filesystem path
-          if (r.id.startsWith("/@fs/")) return r.id.slice(4);
+          if (r.id.startsWith("/@fs/")) { const v = r.id.slice(4); resolveCache.set(cacheKey, v); return v; }
 
           // Virtual pre-bundled id – handle upstream in rewriteModule
-          if (r.id.startsWith("/@id/")) return r.id;
+          if (r.id.startsWith("/@id/")) { resolveCache.set(cacheKey, r.id); return r.id; }
 
           // Absolute path or file URL returned by resolver
-          if (path.isAbsolute(r.id) || r.id.startsWith("file:")) return r.id;
+          if (path.isAbsolute(r.id) || r.id.startsWith("file:")) { resolveCache.set(cacheKey, r.id); return r.id; }
 
           // Unknown shape – let upstream treat as virtual id
-          return r.id;
+          resolveCache.set(cacheKey, r.id); return r.id;
         }
-        return null;
+        resolveCache.set(cacheKey, null); return null;
       }
     }
 
     // file: URLs -> filesystem path
     if (spec.startsWith("file:")) {
-      try {
-        return new URL(spec).pathname;
-      } catch {
-        return null;
-      }
+      try { const v = new URL(spec).pathname; resolveCache.set(cacheKey, v); return v; } catch { resolveCache.set(cacheKey, null); return null; }
     }
 
     // Re-apply aliases defensively
@@ -190,7 +191,9 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       base = path.resolve(projectRoot, spec);
     }
 
-    return tryResolveFileLike(base);
+    const resolved = tryResolveFileLike(base);
+    resolveCache.set(cacheKey, resolved);
+    return resolved;
   }
 
   async function rewriteModule(fsPath) {
@@ -335,11 +338,18 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       // Handle absolute imports that Vite (or upstream transforms) may have left as
       // "/node_modules/...". In Node, an import like that is treated as an absolute
       // path from the filesystem root and will fail ("file:///node_modules/..." does not exist).
-      // We resolve them against the project root and rewrite to our cached file URL.
+      // We prefer to ask Vite's resolver first, then fallback.
       await applyTripletRule(/(['"])\/(node_modules\/[^'"\n]+)(['"])/g, async (spec) => {
-        const childFs = await resolveToFs(`/${spec}`, fsPath);
-        if (!childFs) return `/${spec}`;
-        return await rewriteModule(childFs);
+        const full = '/' + spec; // restore leading slash
+        if (env?.pluginContainer?.resolveId) {
+          const r = await env.pluginContainer.resolveId(full, fsPath);
+          if (r?.external) return full;
+          if (r?.id?.startsWith('/@fs/')) return await rewriteModule(r.id.slice(4));
+          if (r?.id?.startsWith('/@id/')) return await rewriteModule(r.id);
+          if (r?.id && (path.isAbsolute(r.id) || r.id.startsWith('file:'))) return await rewriteModule(r.id);
+        }
+        const childFs = await resolveToFs(full, fsPath);
+        return childFs ? await rewriteModule(childFs) : full;
       });
 
       if (DEBUG && /(^|[^A-Za-z0-9_])~\//.test(out)) {
@@ -392,6 +402,7 @@ export default function workerPlugin() {
   let root = process.cwd();
   let aliases = [];
   let devServer = null;
+  let cacheDirFromVite = null;
 
   return {
     name: "vite:node-worker",
@@ -402,6 +413,7 @@ export default function workerPlugin() {
       isServe = config.command === "serve";
       root = config.root || root;
       aliases = normalizeAliases(config.resolve && config.resolve.alias);
+      cacheDirFromVite = config.cacheDir || path.join(root, 'node_modules/.vite');
     },
 
     configureServer(s) {
@@ -453,7 +465,7 @@ export default function workerPlugin() {
       if (!absId) absId = (resolved?.id || cleanPath).replace(/\?.*$/, "");
 
       if (isServe) {
-      const env =
+        const env =
           this.environment ||
           (devServer?.environments?.client ?? devServer?.environments?.ssr) ||
           null;
@@ -463,6 +475,7 @@ export default function workerPlugin() {
             root,
             aliases,
             env,
+            cacheDir: path.join(cacheDirFromVite || path.join(root, 'node_modules/.vite'), 'node-worker')
           });
           absId = new URL(entryURL).pathname;
         } catch (err) {
@@ -512,6 +525,12 @@ export default function workerPlugin() {
           export default function (options) { return new Worker(new URL(${assetRefId}, import.meta.url), options) }
         `;
       }
+    },
+
+    handleHotUpdate(ctx) {
+      // Best-effort: when files change, future rewrites will produce new hashed cache filenames.
+      // If you later promote caches to module scope, invalidate them here.
+      return ctx.modules;
     },
 
     generateBundle(_, bundle) {
