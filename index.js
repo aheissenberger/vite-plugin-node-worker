@@ -33,7 +33,7 @@ function applyAliases(spec, aliases) {
 
 const DEV_CACHE_DIR = path.join(
   process.cwd(),
-  "node_modules/.vite-node-worker/dev"
+  "node_modules/.vite-plugin-node-worker/dev"
 );
 function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
@@ -230,7 +230,7 @@ function rewriteEntryAliasesToFile(src, entryFile, opts) {
     // DEBUG: warn if any alias tokens remain
     if (DEBUG && /(^|[^A-Za-z0-9_])~\//.test(out)) {
       console.warn(
-        "[vite-node-worker][DEBUG] alias tokens remain after rewrite in",
+        "[vite-plugin-node-worker][DEBUG] alias tokens remain after rewrite in",
         fsPath
       );
       let idx = 0;
@@ -249,7 +249,7 @@ function rewriteEntryAliasesToFile(src, entryFile, opts) {
       fs.writeFileSync(outFile, out + `\n//# sourceURL=${toURL(fsPath)}`);
       if (DEBUG) {
         console.log(
-          "[vite-node-worker][DEBUG] emitted",
+          "[vite-plugin-node-worker][DEBUG] emitted",
           outFile,
           "from",
           fsPath
@@ -278,7 +278,7 @@ export default function workerPlugin() {
   let aliases = [];
 
   return {
-    name: "vite:node-worker-dev",
+    name: "vite:node-worker",
     enforce: "pre",
 
     configResolved(config) {
@@ -352,7 +352,7 @@ export default function workerPlugin() {
 
         if (DEBUG) {
           console.log(
-            "[vite-node-worker][DEBUG] worker entry URL:",
+            "[vite-plugin-node-worker][DEBUG] worker entry URL:",
             toFileURL(absId)
           );
         }

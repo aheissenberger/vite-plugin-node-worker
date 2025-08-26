@@ -1,4 +1,4 @@
-# vite-node-worker-dev
+# vite-plugin-node-worker
 
 A plugin to serve and build ViteJS projects with [Node Worker Threads](https://nodejs.org/api/worker_threads.html).
 
@@ -13,7 +13,7 @@ A plugin to serve and build ViteJS projects with [Node Worker Threads](https://n
 ### Install dependencies
 
 ```bash
-npm install vite-node-worker-dev
+npm install vite-plugin-node-worker
 ```
 
 ### Setup ViteJS
@@ -21,7 +21,7 @@ npm install vite-node-worker-dev
 ```ts
 // ./vite.config.ts
 import { defineConfig } from "vite";
-import workerPlugin from "vite-node-worker-dev";
+import workerPlugin from "vite-plugin-node-worker";
 export default defineConfig({
   plugins: [workerPlugin()],
   worker: {
@@ -72,7 +72,7 @@ export default ${assetRefId}
 **Clean Cache:**
 
 ```bash
-rm -rf node_modules/.vite-node-worker
+rm -rf node_modules/.vite-plugin-node-worker
 ```
 
 **Activate Debug**
