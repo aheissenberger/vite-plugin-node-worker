@@ -1,8 +1,9 @@
 {
   "name": "vite-plugin-node-worker",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Vite plugin for Node.js worker threads. Supports DEV and BUILD modes.",
   "main": "index.js",
+  "types": "vite-plugin-node-worker.d.ts",
   "type": "module",
   "keywords": [
     "vite",
