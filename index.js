@@ -267,9 +267,12 @@ function rewriteEntryAliasesToFile(src, entryFile, opts) {
 }
 
 /**
+ * @fileoverview
  * Resolve `?nodeWorker` and `?modulePath` imports for Node worker_threads.
  * - DEV (serve): generate wrappers that use file URLs (no emitFile).
  * - BUILD: emit chunks and replace placeholders to relative paths.
+ *
+ * @doctype module
  */
 export default function workerPlugin() {
   let sourcemap = false;
