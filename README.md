@@ -6,7 +6,7 @@ A plugin to serve and build ViteJS projects with [Node Worker Threads](https://n
 
 * Supports DEV and BUILD mode
 * Transforms Workers writen in TypeScript.
-* respects Alias configuration in vite.config.ts
+* respects alias configuration in vite.config.ts
 
 ## Install & Configuration
 
