@@ -10,7 +10,6 @@ const DEBUG = process.env.VNW_DEBUG === "1";
 
 function normalizeAliases(raw) {
   if (!raw) return [];
-  // Vite accepts array or object
   if (Array.isArray(raw))
     return raw.map((e) => ({ find: e.find, replacement: e.replacement }));
   return Object.entries(raw).map(([find, replacement]) => ({
@@ -70,28 +69,22 @@ function tryResolveFileLike(base) {
   const candidates = new Set();
 
   if (ext) {
-    // If caller provided an extension (even .js), try exact first
     candidates.add(base);
-    // Then try TypeScript-preferred swaps
     candidates.add(baseNoExt + ".ts");
     candidates.add(baseNoExt + ".tsx");
     candidates.add(baseNoExt + ".mts");
     candidates.add(baseNoExt + ".cts");
-    // Also allow JS module variants
     candidates.add(baseNoExt + ".mjs");
     candidates.add(baseNoExt + ".cjs");
     candidates.add(baseNoExt + ".js");
   } else {
-    // No extension provided: probe common extensions
     for (const e of PROBE_EXTS) {
       candidates.add(baseNoExt + e);
     }
   }
 
-  // If base refers to a directory, try index.* files
   const dir = base;
   for (const e of PROBE_EXTS.slice(1)) {
-    // skip ""
     candidates.add(path.join(dir, `index${e}`));
   }
 
@@ -106,46 +99,73 @@ const toFileURL = (p) => pathToFileURL(path.resolve(p)).href;
 const nodeWorkerAssetUrlRE = /__VITE_NODE_WORKER_ASSET__([\w$]+)__/g;
 
 const RE = {
-  importFrom: /(import\s+[^'";]*?from\s*['"])([^'"\n]+)(['"])/g, // import x from '...'
-  // Safer: avoid catastrophic backtracking on large lines by constraining tokens
-  exportFrom: /(export\s+(?:type\s+)?(?:\{[^}]*\}|\*\s+as\s+\w+|\*|[\w$,\s]*)\s*from\s*['"])([^'"\n]+)(['"])/g, // export { x } from '...'
-  dynImport: /(import\s*\(\s*['"])([^'"\n]+)(['"]\s*\))/g, // import('...')
-  sideImport: /(import\s*['"])([^'"\n]+)(['"])/g, // import '...'
+  importFrom: /(import\s+[^'";]*?from\s*['"])([^'"\n]+)(['"])/g,
+  exportFrom: /(export\s+(?:type\s+)?(?:\{[^}]*\}|\*\s+as\s+\w+|\*|[\w$,\s]*)\s*from\s*['"])([^'"\n]+)(['"])/g,
+  dynImport: /(import\s*\(\s*['"])([^'"\n]+)(['"]\s*\))/g,
+  sideImport: /(import\s*['"])([^'"\n]+)(['"])/g,
 };
+
+const NODE_BUILTINS = new Set([
+  'assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram', 'diagnostics_channel', 'dns', 'domain', 'events', 'fs', 'fs/promises', 'http', 'http2', 'https', 'module', 'net', 'os', 'path', 'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib'
+]);
 
 async function rewriteEntryAliasesToFile(src, entryFile, opts) {
   const projectRoot = (opts && opts.root) || process.cwd();
   const projectAliases = (opts && opts.aliases) || [];
+  const env = opts && opts.env;
 
   const DEV_CACHE_DIR = path.join(
     projectRoot,
     "node_modules/.vite-plugin-node-worker/dev"
   );
 
-  // Cache to avoid rewriting same module multiple times per load()
-  const cache = new Map(); // fsPath -> fileURL
-  const active = new Set(); // fsPath currently being rewritten (cycle guard)
+  const cache = new Map();
+  const active = new Set();
 
   function toURL(p) {
     return toFileURL(p);
   }
   const isExternalUrl = (s) => /^(?:https?:|data:|node:|deno:)/.test(s);
-  function resolveToFs(spec, fromFile) {
-    if (!spec || typeof spec !== 'string') return null;
-    if (isExternalUrl(spec)) return null;
-    // Bare package: keep as-is
-    if (
-      !spec.startsWith(".") &&
-      !spec.startsWith("/") &&
-      !spec.startsWith("file:") &&
-      !/^[A-Za-z]:\\/.test(spec)
-    ) {
-      // try alias first; if alias maps to absolute/relative, continue, else keep as bare
+
+  async function resolveToFs(spec, fromFile) {
+    if (!spec || typeof spec !== "string") return null;
+
+    // Treat external URL-like imports as non-rewritable
+    if (/^(?:https?:|data:|deno:)/.test(spec)) return null;
+
+    // Normalize node: scheme and skip node built-ins entirely
+    const noNodePrefix = spec.replace(/^node:/, "");
+    const isBare = !spec.startsWith(".") && !spec.startsWith("/") && !spec.startsWith("file:") && !/^[A-Za-z]:\\/.test(spec);
+    if (isBare && NODE_BUILTINS.has(noNodePrefix)) return null;
+
+    // Apply project aliases for non-relative, non-absolute specs first
+    if (isBare) {
       const aliased = applyAliases(spec, projectAliases);
-      if (aliased === spec) return null; // no alias mapping -> bare package
-      spec = aliased; // fall-through to resolve
+      if (aliased !== spec) spec = aliased;
+      else if (env?.pluginContainer?.resolveId) {
+        const r = await env.pluginContainer.resolveId(spec, fromFile);
+        if (r && r.id) {
+          // Explicit externals or node: builtins – do not rewrite
+          if (r.external) return null;
+          if (r.id.startsWith("node:")) return null;
+
+          // /@fs/ -> absolute filesystem path
+          if (r.id.startsWith("/@fs/")) return r.id.slice(4);
+
+          // Virtual pre-bundled id – handle upstream in rewriteModule
+          if (r.id.startsWith("/@id/")) return r.id;
+
+          // Absolute path or file URL returned by resolver
+          if (path.isAbsolute(r.id) || r.id.startsWith("file:")) return r.id;
+
+          // Unknown shape – let upstream treat as virtual id
+          return r.id;
+        }
+        return null;
+      }
     }
 
+    // file: URLs -> filesystem path
     if (spec.startsWith("file:")) {
       try {
         return new URL(spec).pathname;
@@ -154,18 +174,16 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       }
     }
 
-    // Apply aliases for non-bare paths as well (e.g., '~/x', custom prefixes)
+    // Re-apply aliases defensively
     spec = applyAliases(spec, projectAliases);
 
+    // Resolve to absolute base path
     let base;
     if (path.isAbsolute(spec)) {
-      // Treat leading '/' as relative to Vite root, not filesystem root
-      if (spec.startsWith("/")) base = path.resolve(projectRoot, spec.slice(1));
-      else base = spec; // e.g., Windows absolute path like C:\\
+      base = spec.startsWith("/") ? path.resolve(projectRoot, spec.slice(1)) : spec;
     } else if (spec.startsWith(".")) {
       base = path.resolve(path.dirname(fromFile), spec);
     } else {
-      // any remaining custom prefix already rewritten by aliases; resolve from project root
       base = path.resolve(projectRoot, spec);
     }
 
@@ -182,14 +200,53 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       return url;
     }
     if (active.has(fsPath)) {
-      // Break cycles early by returning the original file URL without further rewriting
       return toURL(fsPath);
     }
     if (cache.has(fsPath)) return cache.get(fsPath);
 
     let code;
+    const isVirtualId = fsPath.startsWith("/@id/") || fsPath.startsWith("\u0000") || fsPath.startsWith("virtual:");
+
+    if (fsPath.startsWith("/@fs/")) {
+      fsPath = fsPath.slice(4);
+    }
+
     try {
-      code = fs.readFileSync(fsPath, "utf8");
+      if (isVirtualId) {
+        if (!env || typeof env.transformRequest !== "function") {
+          // Cannot transform virtual ids without Vite – leave as-is
+          const url = toURL(fsPath);
+          cache.set(fsPath, url);
+          return url;
+        }
+        // Avoid SSR helpers in dev: use ssr: false
+        const res = await env.transformRequest(fsPath, { ssr: false });
+        if (!res || !res.code) {
+          const url = toURL(fsPath);
+          cache.set(fsPath, url);
+          return url;
+        }
+        code = res.code;
+      } else {
+        code = fs.readFileSync(fsPath, "utf8");
+        const ext = path.extname(fsPath).toLowerCase();
+        if (ext === ".ts" || ext === ".tsx" || ext === ".mts" || ext === ".cts") {
+          try {
+            const esb = await transformWithEsbuild(code, fsPath, {
+              loader: ext === ".tsx" ? "tsx" : "ts",
+              format: "esm",
+              sourcemap: false,
+              target: "esnext",
+              tsconfigRaw: {}
+            });
+            if (esb && esb.code) {
+              code = esb.code;
+            }
+          } catch (e) {
+            if (DEBUG) console.warn("[vite-plugin-node-worker][DEBUG] esbuild transform failed for", fsPath, e);
+          }
+        }
+      }
     } catch (err) {
       if (DEBUG) {
         console.error(
@@ -199,11 +256,9 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
           err
         );
       }
-      // Re-throw so the caller can decide how to proceed rather than silently skipping
       throw err;
     }
 
-    // Optimistically cache original URL and mark as active to prevent recursive cycles
     const originalURL = toURL(fsPath);
     cache.set(fsPath, originalURL);
     active.add(fsPath);
@@ -211,16 +266,14 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       let out = code;
       let ms = new MagicString(out);
 
-      // Helper to apply a list of regex rules of the form /(p1)(spec)(p3)/
       async function applyTripletRule(re, resolver) {
         re.lastIndex = 0;
         for (const m of out.matchAll(re)) {
-          const full = m[0];
           const p1 = m[1];
           const spec = m[2];
           const p3 = m[3];
           if (!spec) continue;
-          const start = /** spec start **/ (m.index + p1.length);
+          const start = m.index + p1.length;
           const end = start + spec.length;
           const replacement = await resolver(spec);
           if (replacement && replacement !== spec) {
@@ -230,34 +283,28 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
         out = ms.toString();
       }
 
-      // side-effect imports: (import '...')
       await applyTripletRule(RE.sideImport, async (spec) => {
-        const childFs = resolveToFs(spec, fsPath);
+        const childFs = await resolveToFs(spec, fsPath);
         if (!childFs || childFs === fsPath) return spec;
-        const childURL = await rewriteModule(childFs);
-        return childURL;
+        return await rewriteModule(childFs);
       });
 
-      // import ... from '...'
       await applyTripletRule(RE.importFrom, async (spec) => {
-        const childFs = resolveToFs(spec, fsPath);
+        const childFs = await resolveToFs(spec, fsPath);
         if (!childFs || childFs === fsPath) return spec;
-        const childURL = await rewriteModule(childFs);
-        return childURL;
+        return await rewriteModule(childFs);
       });
 
-      // export ... from '...'
       try {
         await applyTripletRule(RE.exportFrom, async (spec) => {
-          const childFs = resolveToFs(spec, fsPath);
+          const childFs = await resolveToFs(spec, fsPath);
           if (!childFs || childFs === fsPath) return spec;
-          const childURL = await rewriteModule(childFs);
-          return childURL;
+          return await rewriteModule(childFs);
         });
       } catch (e) {
         if (DEBUG) {
           console.warn(
-            "[vite-plugin-node-worker][DEBUG] skipping export-from rewrite due to complex line in",
+            "[vite-plugin-node-worker][DEBUG] skipping export-from rewrite due to",
             fsPath,
             "\n",
             e
@@ -265,50 +312,52 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
         }
       }
 
-      // catch-all: string literals that start with '~/...' -> /(quote)(spec)(quote)/
       await applyTripletRule(/(['"])(~\/[\w@./-]+)(['"])/g, async (spec) => {
-        const childFs = resolveToFs(spec, fsPath);
+        const childFs = await resolveToFs(spec, fsPath);
         if (!childFs) return spec;
-        const childURL = toURL(childFs);
-        return childURL;
+        return toURL(childFs);
       });
 
-      // DEBUG: warn if any alias tokens remain
+      // Handle absolute imports that Vite (or upstream transforms) may have left as
+      // "/node_modules/...". In Node, an import like that is treated as an absolute
+      // path from the filesystem root and will fail ("file:///node_modules/..." does not exist).
+      // We resolve them against the project root and rewrite to our cached file URL.
+      await applyTripletRule(/(['"])\/(node_modules\/[^'"\n]+)(['"])/g, async (spec) => {
+        const childFs = await resolveToFs(`/${spec}`, fsPath);
+        if (!childFs) return `/${spec}`;
+        return await rewriteModule(childFs);
+      });
+
       if (DEBUG && /(^|[^A-Za-z0-9_])~\//.test(out)) {
         console.warn(
           "[vite-plugin-node-worker][DEBUG] alias tokens remain after rewrite in",
           fsPath
         );
-        let idx = 0;
-        while ((idx = out.indexOf("~/", idx)) !== -1) {
-          const frame = codeFrame(out, idx);
-          console.warn(frame);
-          idx += 2;
-        }
       }
 
-      // Transpile TS/TSX to ESM JS using Vite's helper
-      const esb = await transformWithEsbuild(out, fsPath, {
-        loader: /\.tsx?$/.test(fsPath) ? 'ts' : 'js',
-        format: 'esm',
-        sourcemap: false,
-        target: 'esnext',
+      // Safety normalization for any stray /node_modules/... strings in template literals or elsewhere
+      out = out.replace(/(["'`])\/(node_modules\/[^"'`\n]+)(["'`])/g, (m, q1, p, q3) => {
+        const abs = path.resolve(projectRoot, p);
+        const probed = tryResolveFileLike(abs) || abs;
+        return `${q1}${toURL(probed)}${q3}`;
       });
-      out = esb.code;
 
-      // Emit rewritten (or original if unchanged) to dev cache and return file URL
+
+      // Safety net: if upstream still injected SSR helpers, provide a minimal shim
+      if (out.includes("__vite_ssr_import__")) {
+        out = `async function __vite_ssr_import__(u){ return import(u); }\n` + out;
+      }
+      if (out.includes("__vite_ssr_dynamic_import__")) {
+        out = `async function __vite_ssr_dynamic_import__(u){ return import(u); }\n` + out;
+      }
+
       fs.mkdirSync(DEV_CACHE_DIR, { recursive: true });
       const hash = sha1(fsPath + "|" + out).slice(0, 12);
       const outFile = path.join(DEV_CACHE_DIR, `${hash}.mjs`);
       if (!fileExists(outFile)) {
         fs.writeFileSync(outFile, out + `\n//# sourceURL=${toURL(fsPath)}`);
         if (DEBUG) {
-          console.log(
-            "[vite-plugin-node-worker][DEBUG] emitted",
-            outFile,
-            "from",
-            fsPath
-          );
+          console.log("[vite-plugin-node-worker][DEBUG] emitted", outFile, "from", fsPath);
         }
       }
       const url = toURL(outFile);
@@ -319,24 +368,16 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
     }
   }
 
-  // Start from entry file path, return the rewritten entry code and output URL
   const entryURL = await rewriteModule(entryFile);
   return { entryURL };
 }
 
-/**
- * @fileoverview
- * Resolve `?nodeWorker` and `?modulePath` imports for Node worker_threads.
- * - DEV (serve): generate wrappers that use file URLs (no emitFile).
- * - BUILD: emit chunks and replace placeholders to relative paths.
- *
- * @doctype module
- */
 export default function workerPlugin() {
   let sourcemap = false;
   let isServe = false;
   let root = process.cwd();
   let aliases = [];
+  let devServer = null;
 
   return {
     name: "vite:node-worker",
@@ -347,6 +388,10 @@ export default function workerPlugin() {
       isServe = config.command === "serve";
       root = config.root || root;
       aliases = normalizeAliases(config.resolve && config.resolve.alias);
+    },
+
+    configureServer(s) {
+      devServer = s;
     },
 
     resolveId(id, importer) {
@@ -366,31 +411,24 @@ export default function workerPlugin() {
       const importerFile = (query.importer || "").replace(/\?.*$/, "");
       const tryPaths = [];
 
-      // 1) Use Vite resolver first
       const resolved = await this.resolve(cleanPath, importerFile);
       if (resolved?.id) tryPaths.push(resolved.id.replace(/\?.*$/, ""));
 
-      // Prefer a context-aware resolution that avoids self-recursion
       const resolved2 = await this.resolve(cleanPath, importerFile, {
         skipSelf: true,
       });
       if (resolved2?.id && resolved2.id !== resolved?.id) {
-        // Put this first so it wins over manual fs probing
         tryPaths.unshift(resolved2.id.replace(/\?.*$/, ""));
       }
 
-      // 2) If id is relative, resolve against importer dir
       if (!cleanPath.startsWith("/")) {
         tryPaths.push(path.resolve(path.dirname(importerFile), cleanPath));
       } else {
-        // 3) If id starts with '/' but isn't a real file, treat as relative to Vite root
         tryPaths.push(path.resolve(root, cleanPath.slice(1)));
       }
 
-      // 4) Also try root + id as-is
       tryPaths.push(path.resolve(root, cleanPath));
 
-      // Pick the first existing file
       let absId = tryPaths.find((p) => {
         try {
           return fs.existsSync(p);
@@ -400,39 +438,37 @@ export default function workerPlugin() {
       });
       if (!absId) absId = (resolved?.id || cleanPath).replace(/\?.*$/, "");
 
-      // ---------------- DEV (serve) ----------------
       if (isServe) {
-        // Recursively rewrite the worker entry and its local imports to file: URLs
+        const env =
+          this.environment ||
+          (devServer?.environments?.client ?? devServer?.environments?.ssr) ||
+          null;
+
         try {
           const { entryURL } = await rewriteEntryAliasesToFile("", absId, {
             root,
             aliases,
+            env,
           });
-          absId = new URL(entryURL).pathname; // keep fs path for toFileURL below
+          absId = new URL(entryURL).pathname;
         } catch (err) {
           if (DEBUG) {
             console.error(
-              "[vite-plugin-node-worker][DEBUG] rewrite failed, using original entry without alias transform:",
+              "[vite-plugin-node-worker][DEBUG] rewrite failed:",
               absId,
               "\n",
               err
             );
           }
-          // Fall back to running the original file (may fail if it contains aliases)
         }
 
         if (DEBUG) {
-          console.log(
-            "[vite-plugin-node-worker][DEBUG] worker entry URL:",
-            toFileURL(absId)
-          );
+          console.log("[vite-plugin-node-worker][DEBUG] worker entry URL:", toFileURL(absId));
         }
 
-        // ?modulePath → export file URL for new Worker(url, opts)
         if (query.modulePath != null) {
           return `export default new URL(${JSON.stringify(toFileURL(absId))})`;
         }
-        // ?nodeWorker → export a wrapper that constructs Worker
         if (query.nodeWorker != null) {
           return `
             import { Worker } from 'node:worker_threads';
@@ -443,20 +479,20 @@ export default function workerPlugin() {
         return;
       }
 
-      // ---------------- BUILD ----------------
       if (query.nodeWorker != null || query.modulePath != null) {
-        const hash = this.emitFile({
+        const base = path.basename(cleanPath, path.extname(cleanPath));
+        const refId = this.emitFile({
           type: "chunk",
-          id: cleanPath,
+          id: absId,
           importer: query.importer,
+          fileName: `${base}.worker.mjs`, // temporary name; we will rename in generateBundle
         });
-        const assetRefId = `__VITE_NODE_WORKER_ASSET__${hash}__`;
+
+        const assetRefId = `__VITE_NODE_WORKER_ASSET__${refId}__`;
 
         if (query.modulePath != null) {
-          // build: path export
           return `export default ${assetRefId}`;
         }
-        // build: wrapper export
         return `
           import { Worker } from 'node:worker_threads';
           export default function (options) { return new Worker(new URL(${assetRefId}, import.meta.url), options) }
@@ -464,27 +500,31 @@ export default function workerPlugin() {
       }
     },
 
-    renderChunk(code, chunk) {
-      if (!nodeWorkerAssetUrlRE.test(code)) return null;
-
-      let match;
-      const s = new MagicString(code);
-      nodeWorkerAssetUrlRE.lastIndex = 0;
-
-      while ((match = nodeWorkerAssetUrlRE.exec(code))) {
-        const [full, hash] = match;
-        const filename = this.getFileName(hash);
-        const outputFilepath = toRelativePath(filename, chunk.fileName);
-        const replacement = JSON.stringify(outputFilepath);
-        s.overwrite(match.index, match.index + full.length, replacement, {
-          contentOnly: true,
-        });
+    generateBundle(_, bundle) {
+      // Replace placeholders with final relative paths (no renaming, no hashing)
+      for (const fileName of Object.keys(bundle)) {
+        const b = bundle[fileName];
+        if (b.type !== 'chunk') continue;
+        if (!nodeWorkerAssetUrlRE.test(b.code)) continue;
+        nodeWorkerAssetUrlRE.lastIndex = 0;
+        const s = new MagicString(b.code);
+        let m;
+        while ((m = nodeWorkerAssetUrlRE.exec(b.code))) {
+          const full = m[0];
+          const refId = m[1];
+          let workerName;
+          try {
+            workerName = this.getFileName(refId);
+          } catch {
+            // Unknown refId – skip without throwing
+            continue;
+          }
+          const rel = toRelativePath(workerName, fileName);
+          s.overwrite(m.index, m.index + full.length, JSON.stringify(rel), { contentOnly: true });
+        }
+        b.code = s.toString();
+        if (sourcemap) b.map = s.generateMap({ hires: true });
       }
-
-      return {
-        code: s.toString(),
-        map: sourcemap ? s.generateMap({ hires: true }) : null,
-      };
     },
   };
 }
