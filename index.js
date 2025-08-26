@@ -35,14 +35,6 @@ function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
 }
 
-function codeFrame(text, pos, span = 80) {
-  const start = Math.max(0, pos - span);
-  const end = Math.min(text.length, pos + span);
-  const snippet = text.slice(start, end);
-  const caret = " ".repeat(Math.max(0, pos - start)) + "^";
-  return snippet + "\n" + caret;
-}
-
 function toRelativePath(filename, importer) {
   const relPath = path.posix.relative(path.dirname(importer), filename);
   return relPath.startsWith(".") ? relPath : `./${relPath}`;
@@ -106,7 +98,7 @@ const RE = {
 };
 
 const NODE_BUILTINS = new Set([
-  'assert', 'buffer', 'child_process', 'cluster', 'console', 'constants', 'crypto', 'dgram', 'diagnostics_channel', 'dns', 'domain', 'events', 'fs', 'fs/promises', 'http', 'http2', 'https', 'module', 'net', 'os', 'path', 'perf_hooks', 'process', 'punycode', 'querystring', 'readline', 'repl', 'stream', 'string_decoder', 'sys', 'timers', 'tls', 'tty', 'url', 'util', 'v8', 'vm', 'wasi', 'worker_threads', 'zlib'
+  'assert','buffer','child_process','cluster','console','constants','crypto','dgram','diagnostics_channel','dns','domain','events','fs','fs/promises','http','http2','https','module','net','os','path','perf_hooks','process','punycode','querystring','readline','repl','stream','string_decoder','sys','timers','tls','tty','url','util','v8','vm','wasi','worker_threads','zlib'
 ]);
 
 async function rewriteEntryAliasesToFile(src, entryFile, opts) {
@@ -114,18 +106,29 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
   const projectAliases = (opts && opts.aliases) || [];
   const env = opts && opts.env;
 
-  const DEV_CACHE_DIR = path.join(
-    projectRoot,
-    "node_modules/.vite-plugin-node-worker/dev"
-  );
+  // Use opts.cacheDir if provided, otherwise default to node_modules/.vite-plugin-node-worker/dev
+  const DEV_CACHE_DIR = (opts && opts.cacheDir)
+    ? path.resolve(projectRoot, opts.cacheDir)
+    : path.join(projectRoot, "node_modules/.vite-plugin-node-worker/dev");
 
   const cache = new Map();
   const active = new Set();
 
+  // Cache transpiled outputs by (fsPath, mtime) to avoid re-transpiling unchanged files
+  const esbuildCache = new Map(); // key: fsPath, value: { mtimeMs: number, code: string }
+
+  function getMtimeMsSafe(p) {
+    try {
+      const st = fs.statSync(p);
+      return st.mtimeMs || 0;
+    } catch {
+      return 0;
+    }
+  }
+
   function toURL(p) {
     return toFileURL(p);
   }
-  const isExternalUrl = (s) => /^(?:https?:|data:|node:|deno:)/.test(s);
 
   async function resolveToFs(spec, fromFile) {
     if (!spec || typeof spec !== "string") return null;
@@ -230,20 +233,31 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
       } else {
         code = fs.readFileSync(fsPath, "utf8");
         const ext = path.extname(fsPath).toLowerCase();
-        if (ext === ".ts" || ext === ".tsx" || ext === ".mts" || ext === ".cts") {
-          try {
-            const esb = await transformWithEsbuild(code, fsPath, {
-              loader: ext === ".tsx" ? "tsx" : "ts",
-              format: "esm",
-              sourcemap: false,
-              target: "esnext",
-              tsconfigRaw: {}
-            });
-            if (esb && esb.code) {
-              code = esb.code;
+
+        // Only TS-like files need transpilation
+        const isTsLike = ext === ".ts" || ext === ".tsx" || ext === ".mts" || ext === ".cts";
+        if (isTsLike) {
+          const mtimeMs = getMtimeMsSafe(fsPath);
+          const cached = esbuildCache.get(fsPath);
+          if (cached && cached.mtimeMs === mtimeMs) {
+            // Reuse previous esbuild output
+            code = cached.code;
+          } else {
+            try {
+              const esb = await transformWithEsbuild(code, fsPath, {
+                loader: ext === ".tsx" ? "tsx" : "ts",
+                format: "esm",
+                sourcemap: false,
+                target: "esnext",
+                tsconfigRaw: {}
+              });
+              if (esb && esb.code) {
+                code = esb.code;
+                esbuildCache.set(fsPath, { mtimeMs, code });
+              }
+            } catch (e) {
+              if (DEBUG) console.warn("[vite-plugin-node-worker][DEBUG] esbuild transform failed for", fsPath, e);
             }
-          } catch (e) {
-            if (DEBUG) console.warn("[vite-plugin-node-worker][DEBUG] esbuild transform failed for", fsPath, e);
           }
         }
       }
@@ -439,7 +453,7 @@ export default function workerPlugin() {
       if (!absId) absId = (resolved?.id || cleanPath).replace(/\?.*$/, "");
 
       if (isServe) {
-        const env =
+      const env =
           this.environment ||
           (devServer?.environments?.client ?? devServer?.environments?.ssr) ||
           null;
