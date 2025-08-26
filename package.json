@@ -30,10 +30,10 @@
   "homepage": "https://github.com/aheissenberger/vite-node-worker-dev#readme",
   "files": [
     "index.js",
-    "vite-node-worker-dev.d.ts"
+    "vite-plugin-node-worker.d.ts"
   ],
   "engines": {
-    "node": ">=14"
+    "node": ">=21"
   },
   "publishConfig": {
     "access": "public"
