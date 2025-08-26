@@ -4,6 +4,7 @@ import path from "node:path";
 import { pathToFileURL, URL, URLSearchParams } from "node:url";
 
 import MagicString from "magic-string";
+import { transformWithEsbuild } from "vite";
 
 const DEBUG = process.env.VNW_DEBUG === "1";
 
@@ -31,10 +32,6 @@ function applyAliases(spec, aliases) {
   return out;
 }
 
-const DEV_CACHE_DIR = path.join(
-  process.cwd(),
-  "node_modules/.vite-plugin-node-worker/dev"
-);
 function sha1(s) {
   return crypto.createHash("sha1").update(s).digest("hex");
 }
@@ -110,23 +107,31 @@ const nodeWorkerAssetUrlRE = /__VITE_NODE_WORKER_ASSET__([\w$]+)__/g;
 
 const RE = {
   importFrom: /(import\s+[^'";]*?from\s*['"])([^'"\n]+)(['"])/g, // import x from '...'
-  exportFrom: /(export\s+[^'";]*?from\s*['"])([^'"\n]+)(['"])/g, // export { x } from '...'
+  // Safer: avoid catastrophic backtracking on large lines by constraining tokens
+  exportFrom: /(export\s+(?:type\s+)?(?:\{[^}]*\}|\*\s+as\s+\w+|\*|[\w$,\s]*)\s*from\s*['"])([^'"\n]+)(['"])/g, // export { x } from '...'
   dynImport: /(import\s*\(\s*['"])([^'"\n]+)(['"]\s*\))/g, // import('...')
   sideImport: /(import\s*['"])([^'"\n]+)(['"])/g, // import '...'
 };
 
-function rewriteEntryAliasesToFile(src, entryFile, opts) {
+async function rewriteEntryAliasesToFile(src, entryFile, opts) {
   const projectRoot = (opts && opts.root) || process.cwd();
   const projectAliases = (opts && opts.aliases) || [];
 
+  const DEV_CACHE_DIR = path.join(
+    projectRoot,
+    "node_modules/.vite-plugin-node-worker/dev"
+  );
+
   // Cache to avoid rewriting same module multiple times per load()
   const cache = new Map(); // fsPath -> fileURL
+  const active = new Set(); // fsPath currently being rewritten (cycle guard)
 
   function toURL(p) {
     return toFileURL(p);
   }
   const isExternalUrl = (s) => /^(?:https?:|data:|node:|deno:)/.test(s);
   function resolveToFs(spec, fromFile) {
+    if (!spec || typeof spec !== 'string') return null;
     if (isExternalUrl(spec)) return null;
     // Bare package: keep as-is
     if (
@@ -167,7 +172,7 @@ function rewriteEntryAliasesToFile(src, entryFile, opts) {
     return tryResolveFileLike(base);
   }
 
-  function rewriteModule(fsPath) {
+  async function rewriteModule(fsPath) {
     const skip = /\.(json|css|scss|sass|less|svg|png|jpe?g|gif|webp)$/i.test(
       fsPath
     );
@@ -176,93 +181,146 @@ function rewriteEntryAliasesToFile(src, entryFile, opts) {
       cache.set(fsPath, url);
       return url;
     }
+    if (active.has(fsPath)) {
+      // Break cycles early by returning the original file URL without further rewriting
+      return toURL(fsPath);
+    }
     if (cache.has(fsPath)) return cache.get(fsPath);
 
     let code;
     try {
       code = fs.readFileSync(fsPath, "utf8");
-    } catch {
-      const url = toURL(fsPath);
-      cache.set(fsPath, url);
-      return url;
-    }
-
-    // 1) side-effect imports: import '...'
-    let out = code.replace(RE.sideImport, (m, p1, spec, p3) => {
-      const childFs = resolveToFs(spec, fsPath);
-      if (!childFs) return m;
-      const childURL = rewriteModule(childFs);
-      return `${p1}${childURL}${p3}`;
-    });
-
-    // 2) import ... from '...'
-    out = out.replace(RE.importFrom, (m, p1, spec, p3) => {
-      const childFs = resolveToFs(spec, fsPath);
-      if (!childFs) return m;
-      const childURL = rewriteModule(childFs);
-      return `${p1}${childURL}${p3}`;
-    });
-
-    // 3) export ... from '...'
-    out = out.replace(RE.exportFrom, (m, p1, spec, p3) => {
-      const childFs = resolveToFs(spec, fsPath);
-      if (!childFs) return m;
-      const childURL = rewriteModule(childFs);
-      return `${p1}${childURL}${p3}`;
-    });
-
-    // 4) dynamic import('...')
-    out = out.replace(RE.dynImport, (m, p1, spec, p3) => {
-      const childFs = resolveToFs(spec, fsPath);
-      if (!childFs) return m;
-      const childURL = rewriteModule(childFs);
-      return `${p1}${childURL}${p3}`;
-    });
-
-    // 5) catch-all: single/double-quoted string literals that start with '~/'
-    out = out.replace(/(['"])(~\/[\w@./-]+)\1/g, (m, quote, spec) => {
-      const childFs = resolveToFs(spec, fsPath);
-      if (!childFs) return m;
-      const childURL = toURL(childFs);
-      return `${quote}${childURL}${quote}`;
-    });
-
-    // DEBUG: warn if any alias tokens remain
-    if (DEBUG && /(^|[^A-Za-z0-9_])~\//.test(out)) {
-      console.warn(
-        "[vite-plugin-node-worker][DEBUG] alias tokens remain after rewrite in",
-        fsPath
-      );
-      let idx = 0;
-      while ((idx = out.indexOf("~/", idx)) !== -1) {
-        const frame = codeFrame(out, idx);
-        console.warn(frame);
-        idx += 2;
-      }
-    }
-
-    // Emit rewritten (or original if unchanged) to dev cache and return file URL
-    fs.mkdirSync(DEV_CACHE_DIR, { recursive: true });
-    const hash = sha1(fsPath + "|" + out).slice(0, 12);
-    const outFile = path.join(DEV_CACHE_DIR, `${hash}.mjs`);
-    if (!fileExists(outFile)) {
-      fs.writeFileSync(outFile, out + `\n//# sourceURL=${toURL(fsPath)}`);
+    } catch (err) {
       if (DEBUG) {
-        console.log(
-          "[vite-plugin-node-worker][DEBUG] emitted",
-          outFile,
-          "from",
-          fsPath
+        console.error(
+          "[vite-plugin-node-worker][DEBUG] failed to read file for rewrite:",
+          fsPath,
+          "\n",
+          err
         );
       }
+      // Re-throw so the caller can decide how to proceed rather than silently skipping
+      throw err;
     }
-    const url = toURL(outFile);
-    cache.set(fsPath, url);
-    return url;
+
+    // Optimistically cache original URL and mark as active to prevent recursive cycles
+    const originalURL = toURL(fsPath);
+    cache.set(fsPath, originalURL);
+    active.add(fsPath);
+    try {
+      let out = code;
+      let ms = new MagicString(out);
+
+      // Helper to apply a list of regex rules of the form /(p1)(spec)(p3)/
+      async function applyTripletRule(re, resolver) {
+        re.lastIndex = 0;
+        for (const m of out.matchAll(re)) {
+          const full = m[0];
+          const p1 = m[1];
+          const spec = m[2];
+          const p3 = m[3];
+          if (!spec) continue;
+          const start = /** spec start **/ (m.index + p1.length);
+          const end = start + spec.length;
+          const replacement = await resolver(spec);
+          if (replacement && replacement !== spec) {
+            ms.overwrite(start, end, replacement, { contentOnly: true });
+          }
+        }
+        out = ms.toString();
+      }
+
+      // side-effect imports: (import '...')
+      await applyTripletRule(RE.sideImport, async (spec) => {
+        const childFs = resolveToFs(spec, fsPath);
+        if (!childFs || childFs === fsPath) return spec;
+        const childURL = await rewriteModule(childFs);
+        return childURL;
+      });
+
+      // import ... from '...'
+      await applyTripletRule(RE.importFrom, async (spec) => {
+        const childFs = resolveToFs(spec, fsPath);
+        if (!childFs || childFs === fsPath) return spec;
+        const childURL = await rewriteModule(childFs);
+        return childURL;
+      });
+
+      // export ... from '...'
+      try {
+        await applyTripletRule(RE.exportFrom, async (spec) => {
+          const childFs = resolveToFs(spec, fsPath);
+          if (!childFs || childFs === fsPath) return spec;
+          const childURL = await rewriteModule(childFs);
+          return childURL;
+        });
+      } catch (e) {
+        if (DEBUG) {
+          console.warn(
+            "[vite-plugin-node-worker][DEBUG] skipping export-from rewrite due to complex line in",
+            fsPath,
+            "\n",
+            e
+          );
+        }
+      }
+
+      // catch-all: string literals that start with '~/...' -> /(quote)(spec)(quote)/
+      await applyTripletRule(/(['"])(~\/[\w@./-]+)(['"])/g, async (spec) => {
+        const childFs = resolveToFs(spec, fsPath);
+        if (!childFs) return spec;
+        const childURL = toURL(childFs);
+        return childURL;
+      });
+
+      // DEBUG: warn if any alias tokens remain
+      if (DEBUG && /(^|[^A-Za-z0-9_])~\//.test(out)) {
+        console.warn(
+          "[vite-plugin-node-worker][DEBUG] alias tokens remain after rewrite in",
+          fsPath
+        );
+        let idx = 0;
+        while ((idx = out.indexOf("~/", idx)) !== -1) {
+          const frame = codeFrame(out, idx);
+          console.warn(frame);
+          idx += 2;
+        }
+      }
+
+      // Transpile TS/TSX to ESM JS using Vite's helper
+      const esb = await transformWithEsbuild(out, fsPath, {
+        loader: /\.tsx?$/.test(fsPath) ? 'ts' : 'js',
+        format: 'esm',
+        sourcemap: false,
+        target: 'esnext',
+      });
+      out = esb.code;
+
+      // Emit rewritten (or original if unchanged) to dev cache and return file URL
+      fs.mkdirSync(DEV_CACHE_DIR, { recursive: true });
+      const hash = sha1(fsPath + "|" + out).slice(0, 12);
+      const outFile = path.join(DEV_CACHE_DIR, `${hash}.mjs`);
+      if (!fileExists(outFile)) {
+        fs.writeFileSync(outFile, out + `\n//# sourceURL=${toURL(fsPath)}`);
+        if (DEBUG) {
+          console.log(
+            "[vite-plugin-node-worker][DEBUG] emitted",
+            outFile,
+            "from",
+            fsPath
+          );
+        }
+      }
+      const url = toURL(outFile);
+      cache.set(fsPath, url);
+      return url;
+    } finally {
+      active.delete(fsPath);
+    }
   }
 
   // Start from entry file path, return the rewritten entry code and output URL
-  const entryURL = rewriteModule(entryFile);
+  const entryURL = await rewriteModule(entryFile);
   return { entryURL };
 }
 
@@ -346,12 +404,22 @@ export default function workerPlugin() {
       if (isServe) {
         // Recursively rewrite the worker entry and its local imports to file: URLs
         try {
-          const { entryURL } = rewriteEntryAliasesToFile("", absId, {
+          const { entryURL } = await rewriteEntryAliasesToFile("", absId, {
             root,
             aliases,
           });
           absId = new URL(entryURL).pathname; // keep fs path for toFileURL below
-        } catch {}
+        } catch (err) {
+          if (DEBUG) {
+            console.error(
+              "[vite-plugin-node-worker][DEBUG] rewrite failed, using original entry without alias transform:",
+              absId,
+              "\n",
+              err
+            );
+          }
+          // Fall back to running the original file (may fail if it contains aliases)
+        }
 
         if (DEBUG) {
           console.log(
