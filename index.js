@@ -4,7 +4,9 @@ import path from "node:path";
 import { pathToFileURL, URL, URLSearchParams } from "node:url";
 
 import MagicString from "magic-string";
-import { transformWithEsbuild, normalizePath } from "vite";
+import { transformWithEsbuild, normalizePath,transformWithOxc } from "vite";
+
+const transformWith = typeof transformWithOxc === "function" ? transformWithOxc : transformWithEsbuild;
 
 const DEBUG = process.env.VNW_DEBUG === "1";
 
@@ -247,7 +249,7 @@ async function rewriteEntryAliasesToFile(src, entryFile, opts) {
             code = cached.code;
           } else {
             try {
-              const esb = await transformWithEsbuild(code, fsPath, {
+              const esb = await transformWith(code, fsPath, {
                 loader: ext === ".tsx" ? "tsx" : "ts",
                 format: "esm",
                 sourcemap: false,
